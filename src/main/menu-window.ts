@@ -1,0 +1,1001 @@
+//////////////////////////////////////////////////////////////////////////////////////////
+//   _  _ ____ _  _ ___  ____                                                           //
+//   |_/  |__| |\ | |  \ |  |    This file belongs to Kando, the cross-platform         //
+//   | \_ |  | | \| |__/ |__|    pie menu. Read more on github.com/kando-menu/kando     //
+//                                                                                      //
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// SPDX-FileCopyrightText: Simon Schneegans <code@simonschneegans.de>
+// SPDX-License-Identifier: MIT
+
+import os from 'node:os';
+import { BrowserWindow, screen, ipcMain, app } from 'electron';
+
+import { DeepReadonly } from './settings';
+import {
+  ShowMenuRequest,
+  Menu,
+  MenuItem,
+  Workflow,
+  WMInfo,
+  SelectionSource,
+  MenuInteractionType,
+  RootMenuItem,
+  Vec2,
+} from '../common';
+import { IPCCallback } from '../common/ipc';
+import * as math from '../common/math';
+import { WorkflowExecutor } from './workflow-executor';
+import { KandoApp } from './app';
+
+declare const MENU_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
+declare const MENU_WINDOW_WEBPACK_ENTRY: string;
+
+/**
+ * This is the window which contains the pie menu. It is a transparent window which covers
+ * the whole screen. It is not shown in any task bar and has no frame.
+ */
+export class MenuWindow extends BrowserWindow {
+  /**
+   * This contains the last menu which was shown. It is used to execute the selected
+   * action.
+   */
+  public lastMenu?: DeepReadonly<Menu>;
+
+  /** This contains the last request which was used to show the menu. */
+  public lastRequest?: ShowMenuRequest;
+
+  /**
+   * This contains the time points when the last ten selections were made. It is used to
+   * trigger some achievements.
+   */
+  public lastSelections: { time: number; date: Date }[] = [];
+
+  /**
+   * This will be set to false once a meaningful interaction with the menu has been made
+   * since the menu was shown. It is used to trigger some achievements.
+   */
+  public noopInteraction = true;
+
+  /**
+   * This index is used to select the next menu from the list of menus which would match
+   * the current request. If the sameShortcutBehavior is set to 'cycle', this index is
+   * incremented each time the user presses the same shortcut again.
+   */
+  private menuIndex = 0;
+
+  /** This is true if the window is currently visible. */
+  private visible = false;
+
+  /**
+   * This is set to a value > 0 if we have currently inhibited the shortcut of the active
+   * menu.
+   */
+  private shortcutInhibitionID = 0;
+
+  /** This will resolve once the window has fully loaded. */
+  private windowLoaded = new Promise<void>((resolve) => {
+    ipcMain.on('menu-window.ready', () => {
+      resolve();
+    });
+  });
+
+  /** This timeout is used to hide the window after the fade-out animation. */
+  private hideTimeout: NodeJS.Timeout = null;
+
+  /** The pointer position where the currently shown menu was opened. */
+  private menuOpeningPointerPosition?: Vec2;
+
+  /** Resolves once a closeMenu request has been finalized and the window is hidden. */
+  private pendingCloseMenuPromise?: Promise<void>;
+
+  /** Stores the resolver for pendingCloseMenuPromise while a close is in progress. */
+  private resolvePendingCloseMenu?: () => void;
+
+  /** Stores the rejecter for pendingCloseMenuPromise while a close is in progress. */
+  private rejectPendingCloseMenu?: (error: unknown) => void;
+
+  constructor(
+    private kando: KandoApp,
+    private ipcCallback: IPCCallback
+  ) {
+    const display = screen.getPrimaryDisplay();
+
+    super({
+      webPreferences: {
+        contextIsolation: true,
+        sandbox: true,
+        // Electron only allows loading local resources from apps loaded from the file
+        // system. In development mode, the app is loaded from the webpack dev server.
+        // Hence, we have to disable webSecurity in development mode.
+        webSecurity: process.env.NODE_ENV !== 'development',
+        // Background throttling is disabled to make sure that the menu is properly
+        // hidden. Else it can happen that the last frame of a previous menu is still
+        // visible when the new menu is shown. For now, I have not seen any issues with
+        // background throttling disabled.
+        backgroundThrottling: false,
+        preload: MENU_WINDOW_PRELOAD_WEBPACK_ENTRY,
+        spellcheck: false,
+      },
+      transparent: true,
+      skipTaskbar: true,
+      frame: false,
+      hasShadow: false,
+      x: display.workArea.x,
+      y: display.workArea.y,
+      width: display.workArea.width + 1,
+      height: display.workArea.height + 1,
+      type: kando.getBackend().getBackendInfo().menuWindowType,
+      show: false,
+      // A resizable frameless window still shows the macOS resize cursor at its edges.
+      // The menu covers the work area, so those edges sit on the screen edges.
+      // resizable/movable false only blocks interactive user resize/move; showMenu still
+      // repositions via setBounds() when the pointer is on a secondary display.
+      ...(os.platform() === 'darwin' ? { resizable: false, movable: false } : {}),
+    });
+
+    // When the general settings change, we need to apply the zoom factor to the window.
+    this.kando.getGeneralSettings().onChange('zoomFactor', (newValue) => {
+      this.webContents.setZoomFactor(newValue);
+    });
+
+    // We set the focusable property of the window depending on the 'keepInputFocus'
+    // setting. If this setting is true, the window will not take input focus when it is
+    // shown. This will disable Turbo Mode but make interaction with other applications
+    // easier.
+    if (kando.getGeneralSettings().get('keepInputFocus')) {
+      this.setFocusable(false);
+    }
+
+    this.kando.getGeneralSettings().onChange('keepInputFocus', (newValue) => {
+      this.setFocusable(!newValue);
+    });
+
+    // If the user clicks outside of the menu window, we close the menu. This is only done
+    // if the 'hideOnFocusOut' setting is enabled.
+    this.on('blur', () => {
+      if (this.isVisible() && this.kando.getGeneralSettings().get('hideOnFocusOut')) {
+        this.closeMenu().catch((error) => {
+          console.error(
+            'Failed to close menu window on blur:',
+            error instanceof Error ? error.message : error
+          );
+        });
+      }
+    });
+  }
+
+  /**
+   * This loads the menu window. It will load the menu renderer and set up the IPC
+   * communication with it.
+   *
+   * @returns A promise which resolves once the window has fully loaded.
+   */
+  async load() {
+    this.initMenuRendererAPI();
+
+    await this.loadURL(MENU_WINDOW_WEBPACK_ENTRY);
+
+    // Apply the stored zoom factor to the window.
+    this.webContents.setZoomFactor(this.kando.getGeneralSettings().get('zoomFactor'));
+
+    return this.windowLoaded;
+  }
+
+  /**
+   * This is usually called when the user presses the shortcut. However, it can also be
+   * called for other reasons, e.g. when the user runs the app a second time. It will get
+   * the current window and pointer position and send them to the renderer process.
+   *
+   * @param request Required information to select correct menu.
+   * @param info Information about current desktop environment.
+   * @param systemIconsChanged True if the system icon theme has changed since the last
+   *   time the menu was shown.
+   */
+  public async showMenu(
+    request: ShowMenuRequest,
+    info: WMInfo,
+    systemIconsChanged: boolean
+  ) {
+    const sameShortcutBehavior = this.kando
+      .getGeneralSettings()
+      .get('sameShortcutBehavior');
+
+    // If a menu is currently shown and the user presses the same shortcut again we will
+    // either close the menu or show the next one with the same shortcut.
+    if (this.isVisible()) {
+      let isSameMenu = false;
+      if (request.name != null) {
+        const lastMenuName = this.lastMenu.root.name;
+        isSameMenu = request.name === lastMenuName;
+      } else if (request.trigger != null) {
+        const useID = !this.kando.getBackend().getBackendInfo().supportsShortcuts;
+        const lastTrigger = useID ? this.lastMenu.shortcutID : this.lastMenu.shortcut;
+        isSameMenu = request.trigger === lastTrigger;
+      }
+
+      if (isSameMenu) {
+        // If the 'sameShortcutBehavior' is set to 'nothing', we do nothing :)
+        if (sameShortcutBehavior === 'nothing') {
+          return;
+        }
+
+        // If the 'sameShortcutBehavior' is set to 'close', we hide the menu.
+        if (sameShortcutBehavior === 'close') {
+          await this.closeMenu();
+          return;
+        }
+
+        // If the 'sameShortcutBehavior' is set to 're-open', we hide the menu and show it
+        // again. This is useful if the menu is currently open on another monitor.
+        if (sameShortcutBehavior === 're-open') {
+          await this.closeMenu();
+        }
+
+        // If the 'sameShortcutBehavior' is set to 'cycle', we will show the next menu which
+        // matches the current request.
+        if (
+          sameShortcutBehavior === 'cycle-from-first' ||
+          sameShortcutBehavior === 'cycle-from-recent'
+        ) {
+          this.menuIndex += 1;
+        }
+      }
+    } else if (sameShortcutBehavior === 'cycle-from-first') {
+      // If the menu is not visible and the 'sameShortcutBehavior' is set to 'cycle-from-first',
+      // we reset the menu index to 0. This way, the first menu will be shown again.
+      this.menuIndex = 0;
+    }
+
+    // Select correct menu before showing it to user.
+    const menu = this.chooseMenu(request, info);
+
+    // If no menu was found, we can stop here.
+    if (!menu) {
+      console.log('No menu was found for the current conditions: ', info);
+      return;
+    }
+
+    // We temporarily inhibit the shortcut of the menu (if any) so that key-repeat events
+    // can be received by the renderer. These are necessary for the turbo-mode to work for
+    // single-key shortcuts. The shortcut is restored when the window is hidden.
+    //
+    // If 'sameShortcutBehavior' is set to anything but 'nothing', we have to keep the
+    // shortcut active so that we know when the user presses the shortcut again.
+    if (sameShortcutBehavior === 'nothing') {
+      const useID = !this.kando.getBackend().getBackendInfo().supportsShortcuts;
+      const shortcut = useID ? menu.shortcutID : menu.shortcut;
+
+      // Push the current shortcuts to the stack and inhibit the menu's shortcut
+      if (shortcut && shortcut.length > 0) {
+        if (this.shortcutInhibitionID > 0) {
+          await this.kando.getBackend().releaseInhibition(this.shortcutInhibitionID);
+        }
+
+        this.shortcutInhibitionID = await this.kando
+          .getBackend()
+          .inhibitShortcut(shortcut);
+      }
+    }
+
+    // Store the last menu to be able to execute the selected action later. The WMInfo
+    // will be passed to the action as well.
+    this.lastMenu = menu;
+    this.lastRequest = request;
+    this.menuOpeningPointerPosition = { x: info.pointerX, y: info.pointerY };
+    this.noopInteraction = true;
+
+    this.show();
+
+    // Also, there is this long-standing issue with Windows where the window is not
+    // scaled correctly when it is moved to another monitor with a different DPI
+    // scale: https://github.com/electron/electron/issues/10862
+    // To work around this, we first move the window to the top-left corner of the
+    // screen and make sure that it is only on this monitor by reducing its size to
+    // 1x1 pixel. This seems to apply the correct DPI scaling. Afterward, we can
+    // scale the window to the correct size.
+    if (process.platform === 'win32') {
+      this.setBounds({
+        x: info.workArea.x,
+        y: info.workArea.y,
+        width: 1,
+        height: 1,
+      });
+    }
+
+    // Move and resize the window to the work area of the screen where the pointer is.
+    this.setBounds(info.workArea, false);
+
+    // On macOS with stage manager enabled, this helps to ensure that the window is
+    // really maximized. Else the window will be placed next to the stage manager area.
+    if (os.platform() == 'darwin') {
+      setTimeout(() => this.setBounds(info.workArea, false));
+    }
+
+    // Usually, the menu is shown at the pointer position.
+    const mousePosition = {
+      x: (info.pointerX - info.workArea.x) / this.webContents.getZoomFactor(),
+      y: (info.pointerY - info.workArea.y) / this.webContents.getZoomFactor(),
+    };
+
+    // We have to pass the size of the window to the renderer because window.innerWidth
+    // and window.innerHeight are not reliable when the window has just been resized.
+    // Also, we incorporate the zoom factor of the window so that the clamping to the
+    // work area is done correctly.
+    const windowSize = {
+      x: info.workArea.width / this.webContents.getZoomFactor(),
+      y: info.workArea.height / this.webContents.getZoomFactor(),
+    };
+
+    // Send the menu to the renderer process. If the menu is centered, we delay the
+    // turbo mode. This way, a key has to be pressed first before the turbo mode is
+    // activated. Else, the turbo mode would be activated immediately when the menu is
+    // opened which is not nice if it is not opened at the pointer position.
+    // We also send the name of the current application and window to the renderer.
+    // It will be used as an example in the condition picker of the settings.
+    this.webContents.send(
+      'menu-window.show-menu',
+      this.lastMenu.root,
+      {
+        mousePosition,
+        windowSize,
+        zoomFactor: this.webContents.getZoomFactor(),
+        useFixedPosition: this.lastMenu.useFixedPosition,
+        fixedMenuPosition: {
+          x: this.lastMenu.fixedMenuPosition.x,
+          y: this.lastMenu.fixedMenuPosition.y,
+        },
+        anchoredMode: this.lastMenu.anchored,
+        hoverMode: this.lastMenu.hoverMode,
+        systemIconsChanged,
+      },
+      {
+        appName: info.appName,
+        windowName: info.windowName,
+        windowPosition: {
+          x: info.workArea.x,
+          y: info.workArea.y,
+        },
+      }
+    );
+  }
+
+  /** This shows the window. */
+  public override show() {
+    // Cancel any ongoing window-hiding.
+    if (this.hideTimeout) {
+      clearTimeout(this.hideTimeout);
+      this.hideTimeout = null;
+    }
+    // On Windows, we have to remove the ignore-mouse-events property when un-minimizing
+    // the window. See the hide() method for more information on this workaround.
+    if (process.platform === 'win32') {
+      this.setIgnoreMouseEvents(false);
+    }
+
+    // This does not work on windows nor on Linux/Wayland. At least, it seems to work on
+    // Linux/X11 and macOS.
+    this.setVisibleOnAllWorkspaces(true, {
+      skipTransformProcessType: true,
+      visibleOnFullScreen: true,
+    });
+
+    // We set the window to be always on top. This way, Kando will be visible even on
+    // fullscreen applications.
+    this.setAlwaysOnTop(true, 'screen-saver');
+
+    super.show();
+
+    // There seems to be an issue with GNOME Shell 44.1 where the window does not
+    // get focus when it is shown. This is a workaround for that issue.
+    setTimeout(() => {
+      this.focus();
+    }, 100);
+
+    this.visible = true;
+  }
+
+  /**
+   * This sends a message to the renderer process to close the current submenu. The
+   * renderer will handle this by hiding the current submenu and showing the parent menu
+   * again. If there is no parent menu, nothing will happen.
+   */
+  public closeSubmenu() {
+    if (this.isVisible()) {
+      this.webContents.send(
+        'menu-window.trigger-interaction',
+        MenuInteractionType.eCloseSubmenu
+      );
+    }
+  }
+
+  /**
+   * This hides the window. It will wait for the fade-out animation to finish before
+   * actually hiding the window.
+   */
+  public async closeMenu() {
+    if (!this.isVisible()) {
+      return;
+    }
+
+    // If a close request is already in flight, return the existing promise.
+    if (this.pendingCloseMenuPromise) {
+      return this.pendingCloseMenuPromise;
+    }
+
+    this.pendingCloseMenuPromise = new Promise<void>((resolve, reject) => {
+      this.resolvePendingCloseMenu = () => {
+        this.resolvePendingCloseMenu = undefined;
+        this.rejectPendingCloseMenu = undefined;
+        this.pendingCloseMenuPromise = undefined;
+        resolve();
+      };
+
+      this.rejectPendingCloseMenu = (error: unknown) => {
+        this.resolvePendingCloseMenu = undefined;
+        this.rejectPendingCloseMenu = undefined;
+        this.pendingCloseMenuPromise = undefined;
+        reject(error);
+      };
+    });
+
+    this.webContents.send(
+      'menu-window.trigger-interaction',
+      MenuInteractionType.eCloseMenu
+    );
+
+    return this.pendingCloseMenuPromise;
+  }
+
+  /** Resolves a pending closeMenu promise if there is one. */
+  private settlePendingCloseMenu() {
+    if (this.resolvePendingCloseMenu) {
+      this.resolvePendingCloseMenu();
+    }
+  }
+
+  /** Rejects a pending closeMenu promise if there is one. */
+  private failPendingCloseMenu(error: unknown) {
+    if (this.rejectPendingCloseMenu) {
+      this.rejectPendingCloseMenu(error);
+    }
+  }
+
+  /**
+   * If the fade-out animation is currently running, this already returns false.
+   *
+   * @returns Returns true if the menu window is currently visible and not fading out.
+   */
+  public override isVisible() {
+    return this.visible;
+  }
+
+  /**
+   * This hides the window. When Electron windows are hidden, input focus is not
+   * necessarily returned to the topmost window below the hidden window. This is a problem
+   * if we want to simulate key presses.
+   *
+   * - On Windows, we have to minimize the window instead. This leads to another issue:
+   *   https://github.com/kando-menu/kando/issues/375. To make this weird little window
+   *   really imperceptible, we make it ignore any mouse events.
+   * - On macOS, we have to "hide the app" in order to properly restore input focus. We
+   *   cannot do this when the settings are visible because this would hide them as well.
+   *   So we only do this if the settings are not visible. Kind of bad, but seems to be
+   *   the best solution...
+   * - On Linux, it seems to work with a simple window.hide().
+   *
+   * See also: https://stackoverflow.com/questions/50642126/previous-window-focus-electron
+   */
+  public async hideWindow() {
+    this.visible = false;
+
+    if (this.hideTimeout) {
+      clearTimeout(this.hideTimeout);
+    }
+
+    // If we inhibited the menu's shortcut, we restore it now.
+    if (this.shortcutInhibitionID > 0) {
+      await this.kando.getBackend().releaseInhibition(this.shortcutInhibitionID);
+      this.shortcutInhibitionID = 0;
+    }
+
+    return new Promise<void>((resolve) => {
+      this.hideTimeout = setTimeout(() => {
+        if (process.platform === 'win32') {
+          this.setIgnoreMouseEvents(true);
+          this.minimize();
+        } else if (process.platform === 'darwin') {
+          super.hide();
+          if (!this.kando.isSettingsDialogVisible()) {
+            app.hide();
+          }
+        } else {
+          super.hide();
+        }
+
+        this.hideTimeout = null;
+
+        resolve();
+      }, this.kando.getGeneralSettings().get().fadeOutDuration);
+    });
+  }
+
+  /**
+   * This chooses the correct menu depending on the environment.
+   *
+   * If the request contains a custom menu, this menu is returned. No other conditions are
+   * checked in this case.
+   *
+   * If the request contains a trigger (shortcut or shortcutID) or menu name, we first
+   * check whether there are any menus with the given trigger or name. If none are found,
+   * an exception is thrown.
+   *
+   * Then, a list of menu candidates is assembled and the menu with the best matching
+   * conditions is chosen. If no menu with the given trigger or name is found, null is
+   * returned.
+   *
+   * @param request Required information to select correct menu.
+   * @param info Information about current desktop environment.
+   * @returns The selected menu or null if no menu was found.
+   */
+  public chooseMenu(request: ShowMenuRequest, info: WMInfo) {
+    // If a custom menu is given in the request, we return this menu directly.
+    if (request.menu) {
+      return request.menu;
+    }
+
+    // Get list of current menus.
+    const menus = this.kando.getMenuSettings().get('menus');
+
+    // We check if the request has a menu name. If no menu with this name is found, we
+    // throw an error.
+    if (request.name != null) {
+      const menu = menus.find((m) => m.root.name === request.name);
+      if (!menu) {
+        throw new Error(`No menu with name "${request.name}" found.`);
+      }
+    }
+
+    // We check if the request has a trigger. If no menu with this trigger is found, we
+    // throw an error.
+    if (request.trigger != null) {
+      const useID = !this.kando.getBackend().getBackendInfo().supportsShortcuts;
+      const menu = menus.find(
+        (m) => (useID ? m.shortcutID : m.shortcut) === request.trigger
+      );
+      if (!menu) {
+        throw new Error(`No menu with trigger "${request.trigger}" found.`);
+      }
+    }
+
+    // If no trigger or name is given, we can stop here (this should not happen).
+    if (request.trigger == null && request.name == null) {
+      return null;
+    }
+
+    // Store scores for all menus which match the request.
+    const scores: number[] = [];
+
+    menus.forEach((menu, index) => {
+      scores[index] = 0;
+
+      // If the trigger or name matches, we set the score to 1. Else we skip this menu.
+      if (request.trigger) {
+        const useID = !this.kando.getBackend().getBackendInfo().supportsShortcuts;
+        const menuTrigger = useID ? menu.shortcutID : menu.shortcut;
+        if (request.trigger === menuTrigger) {
+          scores[index] += 1;
+        } else {
+          return;
+        }
+      } else if (request.name) {
+        if (request.name === menu.root.name) {
+          scores[index] += 1;
+        } else {
+          return;
+        }
+      }
+
+      // If no conditions are given, we can stop here. The menu is a solid candidate.
+      if (!menu.conditions) {
+        return;
+      }
+
+      // If the conditions starts with / we treat it as regex, otherwise we treat it as
+      // string. We also ignore case for string conditions.
+      const testStringCondition = (condition: string, value: string) => {
+        // If condition starts with / we treat it as regex. For this we need to extract
+        // the flags from the end of the string and the pattern from the middle.
+        if (condition.startsWith('/')) {
+          const flags = condition.replace(/.*\/([gimy]*)$/, '$1');
+          const pattern = condition.replace(new RegExp('^/(.*?)/' + flags + '$'), '$1');
+          return new RegExp(pattern, flags).test(value);
+        }
+
+        return value.toLowerCase().includes(condition.toLowerCase());
+      };
+
+      // And we start with appName condition check (we know conditions is not null).
+      // If appName condition does not exists we skip it.
+      if (menu.conditions.appName) {
+        if (testStringCondition(menu.conditions.appName, info.appName)) {
+          scores[index] += 1;
+        } else {
+          scores[index] = 0;
+          return;
+        }
+      }
+
+      // We do the same for windowName condition.
+      if (menu.conditions.windowName) {
+        if (testStringCondition(menu.conditions.windowName, info.windowName)) {
+          scores[index] += 1;
+        } else {
+          scores[index] = 0;
+          return;
+        }
+      }
+
+      // And for screenArea condition.
+      if (
+        menu.conditions.screenArea?.xMin != null ||
+        menu.conditions.screenArea?.xMax != null ||
+        menu.conditions.screenArea?.yMin != null ||
+        menu.conditions.screenArea?.yMax != null
+      ) {
+        const condition = menu.conditions.screenArea;
+
+        // We check if cursor is in the specified range.
+        if (
+          (condition.xMin == null || info.pointerX >= condition.xMin) &&
+          (condition.xMax == null || info.pointerX <= condition.xMax) &&
+          (condition.yMin == null || info.pointerY >= condition.yMin) &&
+          (condition.yMax == null || info.pointerY <= condition.yMax)
+        ) {
+          scores[index] += 1;
+        } else {
+          scores[index] = 0;
+          return;
+        }
+      }
+    });
+
+    // Find the highest score.
+    let maxScore = 0;
+    for (const score of scores) {
+      if (score > maxScore) {
+        maxScore = score;
+      }
+    }
+
+    // If no menu has a score greater than 0, we return null.
+    if (maxScore === 0) {
+      return null;
+    }
+
+    // Assemble a list of all menus which have the highest score.
+    const bestMenus: DeepReadonly<Menu>[] = [];
+    for (let i = 0; i < scores.length; i++) {
+      if (scores[i] === maxScore) {
+        bestMenus.push(menus[i]);
+      }
+    }
+
+    // If the sameShortcutBehavior is set to 'cycle', we select the menu at the current
+    // index. If the index is out of bounds, we wrap around to the first menu.
+    const behavior = this.kando.getGeneralSettings().get('sameShortcutBehavior');
+    if (behavior === 'cycle-from-first' || behavior === 'cycle-from-recent') {
+      return bestMenus[this.menuIndex % bestMenus.length];
+    }
+
+    // Else, we select the first menu from the list of best menus.
+    return bestMenus[0];
+  }
+
+  /**
+   * This returns the menu item at the given path from the given root menu. The path is a
+   * string of numbers separated by slashes. Each number is the index of the child menu
+   * item to select. For example, the path "0/2/1" would select the second child of the
+   * third child of the first child of the root menu item.
+   *
+   * @param root The root item of the menu.
+   * @param path The path to the menu item to select.
+   * @returns The menu item at the given path or null if no item is found at the path.
+   */
+  private getMenuItemAtPath(
+    root: DeepReadonly<RootMenuItem>,
+    path: number[]
+  ): DeepReadonly<MenuItem> | null {
+    if (path.length === 0) {
+      return root;
+    }
+
+    let item: DeepReadonly<MenuItem> = root;
+
+    for (const index of path) {
+      if (item.type !== 'submenu' && item.type !== 'root') {
+        return null;
+      }
+
+      if (!item.children || index < 0 || index >= item.children.length) {
+        return null;
+      }
+      item = item.children[index];
+    }
+
+    return item;
+  }
+
+  /**
+   * Setup IPC communication with the renderer process. See
+   * ../menu-renderer/menu-window-api.ts for the corresponding renderer API.
+   */
+  private initMenuRendererAPI() {
+    // Move the mouse pointer. This is used to move the pointer to the center of the
+    // menu when the menu is opened too close to the screen edge.
+    ipcMain.on('menu-window.move-pointer', (event, dist) => {
+      this.movePointer(dist, true).catch((error) => {
+        console.error(
+          'Failed to move mouse pointer:',
+          error instanceof Error ? error.message : error
+        );
+      });
+    });
+
+    // When the user performs an interaction with the menu, we need to execute the
+    // corresponding workflow. We also report the interaction to whoever requested the
+    // menu and track some achievements.
+    ipcMain.on(
+      'menu-window.finalize-interaction',
+      async (
+        event,
+        type: MenuInteractionType,
+        path: number[],
+        time: number,
+        source: SelectionSource
+      ) => {
+        // In any case, we report the interaction to whoever requested the menu.
+        this.ipcCallback(type, path);
+
+        // For open-menu, and close-submenu interactions, we do not need to execute any
+        // workflows.
+        if (
+          type === MenuInteractionType.eOpenMenu ||
+          type === MenuInteractionType.eCloseSubmenu
+        ) {
+          return;
+        }
+
+        // If the menu should be closed, we hide the window and stop here. There is also
+        // no workflow to execute in this case. We only check whether no workflow was
+        // executed in order to track the "cancels" achievement.
+        if (type === MenuInteractionType.eCloseMenu) {
+          try {
+            await this.hideWindow();
+            this.settlePendingCloseMenu();
+          } catch (error) {
+            this.failPendingCloseMenu(error);
+            throw error;
+          }
+
+          if (this.noopInteraction) {
+            this.kando.achievementTracker.incrementStat('cancels');
+          }
+          return;
+        }
+
+        const item = this.getMenuItemAtPath(this.lastMenu.root, path);
+
+        if (!item) {
+          console.error('No item found at path: ', path);
+          return;
+        }
+
+        // The user clicked the root menu item.
+        if (type === MenuInteractionType.eActivateMenu && item.type === 'root') {
+          if (this.lastMenu.root.activateWorkflow) {
+            this.executeWorkflow(this.lastMenu.root.activateWorkflow);
+          }
+          return;
+        }
+
+        // If the target of the selection is a submenu, we execute its open-workflow.
+        if (type === MenuInteractionType.eOpenSubmenu && item.type === 'submenu') {
+          if (item.openWorkflow) {
+            this.executeWorkflow(item.openWorkflow);
+          }
+          return;
+        }
+
+        // For buttons and submenus, we may need to execute the hover-workflow.
+        if (
+          (type === MenuInteractionType.eHoverButton && item.type === 'button') ||
+          (type === MenuInteractionType.eHoverSubmenu && item.type === 'submenu')
+        ) {
+          if (item.hoverWorkflow) {
+            this.executeWorkflow(item.hoverWorkflow);
+          }
+          return;
+        }
+
+        // For buttons, submenus, and the root item, there are also the scroll-workflows.
+        if (
+          type === MenuInteractionType.eScrollUp ||
+          type === MenuInteractionType.eScrollDown
+        ) {
+          const workflow =
+            type === MenuInteractionType.eScrollUp
+              ? item.scrollUpWorkflow
+              : item.scrollDownWorkflow;
+
+          if (workflow) {
+            this.executeWorkflow(workflow);
+          }
+          return;
+        }
+
+        // For submenus, there is also the activate-workflow.
+        if (type === MenuInteractionType.eActivateMenu && item.type === 'submenu') {
+          if (item.activateWorkflow) {
+            this.executeWorkflow(item.activateWorkflow);
+          }
+          return;
+        }
+
+        // Finally, there is the select-workflow for buttons.
+        if (type === MenuInteractionType.eSelectButton && item.type === 'button') {
+          const menuOpeningPointerPosition = this.menuOpeningPointerPosition
+            ? { ...this.menuOpeningPointerPosition }
+            : undefined;
+
+          await this.returnPointerToMenuOpeningPosition(menuOpeningPointerPosition);
+
+          if (item.selectWorkflow) {
+            await this.executeWorkflow(item.selectWorkflow);
+          }
+
+          this.kando.achievementTracker.onSelectionMade(
+            Math.min(Math.max(path.length, 1), 3) as 1 | 2 | 3, // depth between 1 and 3
+            time,
+            source
+          );
+
+          this.lastSelections.push({ time, date: new Date() });
+          if (this.lastSelections.length > 10) {
+            this.lastSelections.shift();
+          }
+
+          // Check for many-selections-streak achievement.
+          if (this.lastSelections.length === 10) {
+            const oldest = this.lastSelections[0];
+            const newest = this.lastSelections[9];
+            const timeDiff = newest.date.getTime() - oldest.date.getTime();
+
+            if (timeDiff <= 30000) {
+              this.kando.achievementTracker.incrementStat('manySelectionsStreaks1');
+            }
+
+            if (timeDiff <= 20000) {
+              this.kando.achievementTracker.incrementStat('manySelectionsStreaks2');
+            }
+
+            if (timeDiff <= 10000) {
+              this.kando.achievementTracker.incrementStat('manySelectionsStreaks3');
+            }
+          }
+
+          // Check for the speedy-selections-streak achievement.
+          if (this.lastSelections.length === 10) {
+            let average = 0.0;
+            this.lastSelections.forEach((selection) => {
+              average += selection.time / this.lastSelections.length;
+            });
+            if (average < 750) {
+              this.kando.achievementTracker.incrementStat('speedySelectionsStreaks1');
+            }
+            if (average < 500) {
+              this.kando.achievementTracker.incrementStat('speedySelectionsStreaks2');
+            }
+            if (average < 250) {
+              this.kando.achievementTracker.incrementStat('speedySelectionsStreaks3');
+            }
+          }
+        }
+      }
+    );
+
+    // Show the settings window when the user clicks on the settings button in the menu.
+    ipcMain.on('menu-window.show-settings', () => {
+      this.kando.showSettings();
+    });
+  }
+
+  /**
+   * Small helper method to execute a given workflow.
+   *
+   * @param workflow The workflow to execute.
+   */
+  private executeWorkflow(workflow: DeepReadonly<Workflow>) {
+    if (this.noopInteraction) {
+      this.noopInteraction = WorkflowExecutor.getInstance().isNoopWorkflow(workflow);
+    }
+
+    return WorkflowExecutor.getInstance().executeWorkflow(workflow, this.kando);
+  }
+
+  /**
+   * Moves the pointer by the given logical-pixel distance.
+   *
+   * @param dist The distance to move the pointer.
+   * @param includeZoom Whether to include the menu window zoom factor in the movement.
+   * @param referencePoint The point used to choose the display scale on Windows.
+   */
+  private async movePointer(dist: Vec2, includeZoom: boolean, referencePoint?: Vec2) {
+    const scaledDist = math.multiply(
+      dist,
+      this.getPointerMoveScale(includeZoom, referencePoint)
+    );
+
+    if (scaledDist.x === 0 && scaledDist.y === 0) {
+      return;
+    }
+
+    await this.kando.getBackend().movePointer(scaledDist.x, scaledDist.y);
+  }
+
+  /**
+   * Gets the scale factor required by the backend for pointer movement.
+   *
+   * @param includeZoom Whether to include the menu window zoom factor in the movement.
+   * @param referencePoint The point used to choose the display scale on Windows.
+   * @returns The scale factor for pointer movement.
+   */
+  private getPointerMoveScale(includeZoom: boolean, referencePoint?: Vec2) {
+    let scale = 1;
+
+    // On Windows, the pointer movement has to be scaled to the DPI scale of the
+    // display where the pointer is currently shown.
+    if (os.platform() === 'win32') {
+      const bounds = this.getBounds();
+      const display = screen.getDisplayNearestPoint(
+        referencePoint ?? { x: bounds.x, y: bounds.y }
+      );
+      scale = display.scaleFactor;
+    }
+
+    // Renderer-originated movement is relative to the zoomed menu window.
+    if (includeZoom) {
+      scale *= this.webContents.getZoomFactor();
+    }
+
+    return scale;
+  }
+
+  /**
+   * Moves the pointer back to where it was when the selected menu was opened.
+   *
+   * @param openingPosition The pointer position where the selected menu was opened.
+   */
+  private async returnPointerToMenuOpeningPosition(openingPosition?: Vec2) {
+    if (!this.kando.getGeneralSettings().get('returnPointerToMenuOpeningPosition')) {
+      return;
+    }
+
+    if (!openingPosition) {
+      return;
+    }
+
+    try {
+      const info = await this.kando.getBackend().getWMInfo();
+      const currentPosition = { x: info.pointerX, y: info.pointerY };
+      const offset = math.subtract(openingPosition, currentPosition);
+
+      await this.movePointer(offset, false, currentPosition);
+    } catch (error) {
+      console.error(
+        'Failed to return mouse pointer to menu opening position:',
+        error instanceof Error ? error.message : error
+      );
+    }
+  }
+}
